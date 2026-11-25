@@ -1,0 +1,8 @@
+# Dependencies for app3.py, firestore_db.py, and firebase_config.py
+
+streamlit
+numpy
+pandas
+python-pptx
+firebase-admin
+openpyxl
