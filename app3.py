@@ -47,7 +47,7 @@ PRESETS = {
     "Loan requests": {
         "detect": ["Loan ID", "Amount Requested", "Status"],
         "settings": {
-            "title": "Loan Requests Report",
+            "title": "Monthly Loan Report",
             "date_col": "Date Created",
             "blocked": ["Loan ID", "Customer Petra ID", "Customer Name"],
         },
@@ -144,7 +144,7 @@ PPTX_TYPES = {
 }
 
 DEFAULT_SETTINGS = {
-    "title": "Report", "currency": "", "footer": "",
+    "title": "Monthly Loan Report", "currency": "", "footer": "",
     "date_col": None, "date_preset": "All data", "start": None, "end": None,
     "grain": "month", "week_start": "Monday", "fiscal_start": 1,
     "undated": "exclude", "fill_empty": True, "compare_prev": False,
@@ -907,7 +907,6 @@ def preset_specs(preset, columns):
 
 def starting_config(df, info, filename):
     settings = copy.deepcopy(DEFAULT_SETTINGS)
-    settings["title"] = re.sub(r"[_\-]+", " ", filename.rsplit(".", 1)[0]).strip().title() + " Report"
     settings["blocked"] = [c for c in df.columns if info[c]["id_like"] or info[c]["sensitive"]]
     dates = [c for c in df.columns if info[c]["kind"] == "date"]
     settings["date_col"] = dates[0] if dates else None
@@ -1473,7 +1472,19 @@ def main():
                 st.rerun()
 
     with st.sidebar:
-        st.header("Date range")
+        st.header("Not allowed on a slide")
+        settings["blocked"] = st.multiselect(
+            "Columns never allowed on a slide", cols, format_func=tag, key=f"{ver}|blocked",
+            default=[c for c in settings["blocked"] if c in cols],
+            help="Blocked columns cannot be used to group or split a chart. Names, IDs, phones and emails are ticked for you.")
+
+    tab_rules, tab_report, tab_charts, tab_preview = st.tabs(
+        ["1. Data rules", "2. Report settings", "3. Charts", "4. Preview and download"])
+
+    # ---- Tab 1: what can enter the report ----
+    with tab_rules:
+        st.caption("These rules apply before anything else. Slides only ever show totals and counts.")
+        st.markdown("**Date range**")
         date_options = [NO_COL] + cols
         chosen = st.selectbox("Date column", date_options, index=pick_index(date_options, settings["date_col"]),
                               format_func=lambda c: c if c == NO_COL else tag(c), key=f"{ver}|datecol")
@@ -1496,17 +1507,7 @@ def main():
                     if len(picked) == 2:
                         settings["start"], settings["end"] = picked[0].isoformat(), picked[1].isoformat()
                 st.caption(f"Data runs from {lo:%d %b %Y} to {hi:%d %b %Y}.")
-
-    tab_rules, tab_report, tab_charts, tab_preview = st.tabs(
-        ["1. Data rules", "2. Report settings", "3. Charts", "4. Preview and download"])
-
-    # ---- Tab 1: what can enter the report ----
-    with tab_rules:
-        st.caption("These rules apply before anything else. Slides only ever show totals and counts.")
-        settings["blocked"] = st.multiselect(
-            "Columns never allowed on a slide", cols, format_func=tag, key=f"{ver}|blocked",
-            default=[c for c in settings["blocked"] if c in cols],
-            help="Blocked columns cannot be used to group or split a chart. Names, IDs, phones and emails are ticked for you.")
+        st.divider()
         c1, c2 = st.columns(2)
         settings["min_group"] = c1.number_input(
             "Smallest group allowed on a slide (0 = off)", 0, 100, int(settings["min_group"]), key=f"{ver}|mingroup",
