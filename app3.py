@@ -16,6 +16,7 @@ Run with:  streamlit run app.py
 
 import copy
 import hashlib
+import html
 import io
 import json
 import re
@@ -31,6 +32,7 @@ from pptx.chart.data import CategoryChartData
 from pptx.dml.color import RGBColor
 from pptx.enum.chart import XL_CHART_TYPE, XL_LEGEND_POSITION
 from pptx.enum.shapes import MSO_SHAPE
+from pptx.enum.text import PP_ALIGN
 from pptx.util import Inches, Pt
 
 # ---------------------------------------------------------------------------
@@ -52,15 +54,30 @@ PRESETS = {
             "blocked": ["Loan ID", "Customer Petra ID", "Customer Name"],
         },
         "charts": [
+            # Slide 2: four summary cards (the fourth is filled in automatically if you only list three)
             {"chart_type": "kpi", "agg": "count", "title": "Loan requests"},
             {"chart_type": "kpi", "agg": "sum", "y": "Amount Requested", "title": "Total requested"},
             {"chart_type": "kpi", "agg": "sum", "y": "Disbursed Amount", "title": "Total disbursed"},
-            {"chart_type": "column", "x": "Date Created", "agg": "sum", "y": "Amount Requested"},
-            {"x": "Status", "agg": "sum", "y": "Amount Requested"},
-            {"x": "Product", "agg": "sum", "y": "Amount Requested"},
-            {"x": "Provider", "agg": "sum", "y": "Amount Requested"},
-            {"x": "Source", "agg": "sum", "y": "Amount Requested"},
-            {"x": "Loan Type", "agg": "sum", "y": "Amount Requested"},
+            {"chart_type": "kpi", "agg": "average", "y": "Amount Requested", "title": "Average request"},
+            # Trend: one full-width chart, then the same trend split by status
+            {"chart_type": "column", "x": "Date Created", "agg": "sum", "y": "Amount Requested",
+             "section": "Trend"},
+            {"chart_type": "stacked column", "x": "Date Created", "agg": "sum", "y": "Amount Requested",
+             "split": "Status", "section": "Trend"},
+            # Breakdown: two charts on one slide, then single charts
+            {"chart_type": "doughnut", "x": "Status", "agg": "sum", "y": "Amount Requested",
+             "other_bucket": True, "section": "Breakdown", "pair_next": True},
+            {"x": "Product", "agg": "sum", "y": "Amount Requested", "section": "Breakdown"},
+            {"x": "Provider", "agg": "sum", "y": "Amount Requested", "section": "Breakdown"},
+            {"chart_type": "pie", "x": "Source", "agg": "count", "other_bucket": True,
+             "section": "Breakdown"},
+            {"x": "Loan Type", "agg": "sum", "y": "Amount Requested", "section": "Breakdown",
+             "chart_type": "column", "pair_next": True},
+            {"chart_type": "grouped column", "x": "Provider", "agg": "count", "split": "Loan Type",
+             "section": "Breakdown"},
+            # Cross view
+            {"chart_type": "heatmap", "x": "Product", "agg": "sum", "y": "Amount Requested",
+             "split": "Status", "section": "Where the money sits"},
         ],
     },
 }
@@ -83,7 +100,7 @@ PIE_MAX = 6          # most slices a pie or doughnut may have
 PIE_SHOW_MAX = 8     # pie is only offered when the column has this few values
 MAX_SPLIT = 6        # most series when a chart is split by a second column
 TABLE_MAX_ROWS = 15  # most rows on a table slide
-MAX_KPI_CARDS = 8
+MAX_KPI_CARDS = 8   # summary cards in total (shown four to a slide)
 MAX_TREND_POINTS = 120
 FEW_VALUES = 12      # a number column with this few values can be used as categories
 
@@ -99,6 +116,7 @@ RED = RGBColor(0xC0, 0x39, 0x2B)
 WHITE = RGBColor(0xFF, 0xFF, 0xFF)
 SERIES_COLORS = [RGBColor(0x0E, 0x7C, 0x61), RGBColor(0x86, 0xD0, 0xB8), RGBColor(0x2F, 0xA8, 0x8A),
                  RGBColor(0x5B, 0x8C, 0x7E), RGBColor(0xB5, 0xE3, 0xD4), RGBColor(0x3D, 0x5A, 0x50)]
+LIGHT_SERIES = (1, 4)  # positions in SERIES_COLORS that are light, so they need dark labels
 HEX_COLORS = ["#0E7C61", "#86D0B8", "#2FA88A", "#5B8C7E", "#B5E3D4", "#3D5A50"]
 
 # ---------------------------------------------------------------------------
@@ -119,6 +137,7 @@ EXCEL_FORMATS = {"full": "#,##0", "thousands (K)": '#,##0.0,"K"',
 GRAINS = ["day", "week", "month", "quarter", "year"]
 DATE_PRESETS = ["All data", "Last 7 days", "Last 30 days", "Last 90 days", "This month", "Last month",
                 "Quarter to date", "Year to date", "Custom"]
+CUSTOM_LABEL = "Custom dates (pick any start and end)"
 DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 DAY_CODES = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
 MONTH_NAMES = ["January", "February", "March", "April", "May", "June", "July",
@@ -128,9 +147,18 @@ FILTER_MODES = ["include only", "exclude", "not blank"]
 SUPPRESS_MODES = ["merge into Other", "hide"]
 UNDATED_MODES = ["exclude", "include in non-trend charts"]
 
-STACKED = ("stacked column", "stacked bar")
-SPLIT_TYPES = ("line",) + STACKED
-KEEP_ZERO_TYPES = ("column", "bar", "area") + STACKED
+STACKED = ("stacked column", "stacked bar", "100% stacked column", "100% stacked bar", "stacked area")
+GROUPED = ("grouped column", "grouped bar")
+NEEDS_SPLIT = STACKED + GROUPED + ("heatmap",)      # these cannot be drawn without a Split by column
+SPLIT_TYPES = ("line",) + NEEDS_SPLIT
+KEEP_ZERO_TYPES = ("column", "bar", "area") + STACKED + GROUPED
+HORIZONTAL = ("bar", "stacked bar", "100% stacked bar", "grouped bar")
+GRID_TYPES = ("table", "heatmap")                   # drawn as a grid of cells rather than a chart
+
+# Insight callouts and slide layout
+INSIGHT_POSITIONS = ["auto", "right", "left", "bottom", "top", "none"]
+INSIGHT_CYCLE = ["right", "bottom", "left", "top"]  # "auto" walks through these so slides vary
+KPI_PER_SLIDE = 4                                   # summary cards per slide (one symmetric row)
 
 PPTX_TYPES = {
     "column": XL_CHART_TYPE.COLUMN_CLUSTERED,
@@ -141,14 +169,19 @@ PPTX_TYPES = {
     "doughnut": XL_CHART_TYPE.DOUGHNUT,
     "stacked column": XL_CHART_TYPE.COLUMN_STACKED,
     "stacked bar": XL_CHART_TYPE.BAR_STACKED,
+    "100% stacked column": XL_CHART_TYPE.COLUMN_STACKED_100,
+    "100% stacked bar": XL_CHART_TYPE.BAR_STACKED_100,
+    "stacked area": XL_CHART_TYPE.AREA_STACKED,
+    "grouped column": XL_CHART_TYPE.COLUMN_CLUSTERED,
+    "grouped bar": XL_CHART_TYPE.BAR_CLUSTERED,
 }
 
 DEFAULT_SETTINGS = {
     "title": "Monthly Loan Report", "currency": "", "footer": "",
-    "date_col": None, "date_preset": "All data", "start": None, "end": None,
+    "date_col": None, "date_preset": "Custom", "start": None, "end": None,
     "grain": "month", "week_start": "Monday", "fiscal_start": 1,
     "undated": "exclude", "fill_empty": True, "compare_prev": False,
-    "quality_slide": False, "summary_headline": "", "summary_notes": "",
+    "quality_slide": False, "summary_headline": "", "summary_notes": "", "auto_insights": True,
     "min_group": 0, "suppress_mode": "merge into Other",
     "blocked": [], "filters": [],
 }
@@ -168,6 +201,7 @@ def new_spec(**changes):
         "number_format": "full", "show_labels": True, "gridlines": False,
         "show_blanks": True, "rename": "", "notes": "",
         "section": "", "headline": "",
+        "pair_next": False, "insight_pos": "auto",
     }
     spec.update(changes)
     return spec
@@ -457,11 +491,13 @@ def value_label(agg, y):
 def chart_types_for(xkind, nunique=0):
     """Chart types that make sense for the type of the X column."""
     if xkind == "date":
-        return ["column", "line", "area", "stacked column", "table"]
+        return ["column", "line", "area", "stacked column", "stacked area", "grouped column",
+                "100% stacked column", "heatmap", "table"]
     types = [AUTO, "column", "bar"]
     if nunique <= PIE_SHOW_MAX:
         types += ["pie", "doughnut"]
-    return types + ["stacked column", "stacked bar", "table"]
+    return types + ["grouped column", "grouped bar", "stacked column", "stacked bar",
+                    "100% stacked column", "100% stacked bar", "heatmap", "table"]
 
 
 def aggregate(work, keys, agg):
@@ -518,6 +554,8 @@ def auto_title(spec, grain=None):
     if spec["chart_type"] == "kpi" or not spec["x"]:
         return label
     by = f"{grain} ({spec['x']})" if grain else spec["x"]
+    if spec.get("split") and spec["chart_type"] in SPLIT_TYPES:
+        by += f" and {spec['split']}"
     return f"{label} by {by}"
 
 
@@ -572,8 +610,8 @@ def render_chart(spec, ctx):
         errors.append(f"'{ctype}' is not available when X is a {xkind} column.")
     if ctype in ("pie", "doughnut") + STACKED and agg not in ("sum", "count"):
         errors.append(f"'{ctype}' charts only work with sum or count.")
-    if ctype in STACKED and not split:
-        errors.append("Stacked charts need a 'Split by' column.")
+    if ctype in NEEDS_SPLIT and not split:
+        errors.append(f"'{ctype}' needs a 'Split by' column.")
     if split:
         p = column_problem(split, ctx.info, ctx.blocked)
         if p:
@@ -630,7 +668,7 @@ def render_chart(spec, ctx):
     if xkind == "category":
         if ctype in ("pie", "doughnut"):
             top_n = min(top_n, PIE_MAX - (1 if spec["other_bucket"] else 0))
-        if ctype == "table":
+        if ctype in GRID_TYPES:
             top_n = min(top_n, TABLE_MAX_ROWS)
         if work.empty:
             return skipped(spec, ["No rows left after hiding small groups."], warns)
@@ -672,6 +710,9 @@ def render_chart(spec, ctx):
     res.columns = [str(c) for c in res.columns]
     if res.empty:
         return skipped(spec, ["Nothing to show."], warns)
+    if ctype in GRID_TYPES and xkind == "date" and len(res) > TABLE_MAX_ROWS:
+        warns.append(f"Only the latest {TABLE_MAX_ROWS} periods fit in a {ctype}. Use a coarser time grain to see more.")
+        res = res.iloc[-TABLE_MAX_ROWS:]
     if ctype in ("pie", "doughnut"):
         if (res < 0).any().any():
             return skipped(spec, ["Pie charts cannot show negative values."], warns)
@@ -699,6 +740,7 @@ def render_chart(spec, ctx):
         res = res.loc[[i for i in res.index if i != OTHER] + [OTHER]]
 
     # 6. Number format and labels
+    raw = res.copy()  # untouched numbers, used for the automatic insight
     fmt = spec["number_format"]
     if fmt == "percent of total":
         total = res.to_numpy().sum()
@@ -724,20 +766,69 @@ def render_chart(spec, ctx):
     money = agg in MONEY_AGGS and spec["y"] and fmt != "percent of total"
     currency = s["currency"] if money else ""
     slide = {
-        "kind": "table" if ctype == "table" else "chart", "id": spec["id"], "title": title,
+        "kind": ctype if ctype in GRID_TYPES else "chart", "id": spec["id"], "title": title,
         "chart_type": resolved, "categories": labels, "frame": res,
         "series": [(c, list(res[c])) for c in res.columns],
         "number_format": excel_format(fmt, res.to_numpy()), "fmt_name": fmt,
-        "show_labels": spec["show_labels"] and len(labels) <= 24, "gridlines": spec["gridlines"],
+        "show_labels": (spec["show_labels"] and len(labels) <= 24 and len(labels) * res.shape[1] <= 40
+                        and ctype != "stacked area"),
+        "gridlines": spec["gridlines"],
         "notes": spec["notes"], "footnotes": foot, "warnings": warns,
         "section": spec.get("section", ""), "headline": spec.get("headline", ""),
+        "pair_next": bool(spec.get("pair_next")), "insight_pos": spec.get("insight_pos", "auto"),
+        "is_date": xkind == "date",
+        "auto_insight": None if ctype in GRID_TYPES else make_insight(
+            raw, labels, xkind, agg, "full" if fmt == "percent of total" else fmt, currency, name),
     }
-    if ctype == "table":
+    if ctype in GRID_TYPES:
         slide["header"] = [x] + list(res.columns)
         slide["rows"] = [[lab] + [format_value(v, "full" if fmt == "percent of total" else fmt, currency)
                                   if fmt != "percent of total" else f"{v:.1%}" for v in row]
                          for lab, row in zip(labels, res.to_numpy())]
     return slide
+
+
+def make_insight(res, labels, xkind, agg, fmt, currency, name):
+    """A short automatic takeaway for a chart: (big number, sentence), or None."""
+    if res.shape[0] < 2:
+        return None
+    values = res.to_numpy(dtype=float)
+    multi = values.shape[1] > 1
+    if multi and agg not in ADDITIVE:
+        return None  # adding averages or medians together would be wrong
+    totals = np.nansum(values, axis=1)
+    if len(totals) < 2 or not np.isfinite(totals).all():
+        return None
+
+    def fv(v):
+        return format_value(v, fmt, currency)
+
+    def when(label):  # "Week of 26 Jan 26" reads better as "the week of 26 Jan 26"
+        return "the w" + label[1:] if label.startswith("Week of") else label
+
+    top = int(np.argmax(totals))
+    if xkind == "date":
+        first, last = totals[0], totals[-1]
+        text = (f"{name} moved from {fv(first)} in {when(labels[0])} to {fv(last)} in {when(labels[-1])}. "
+                f"The peak was {when(labels[top])} at {fv(totals[top])}.")
+        stat = f"{(last - first) / abs(first):+.0%}" if first else None
+        return stat, text
+    if agg in ADDITIVE and (totals >= 0).all() and totals.sum() > 0:
+        share = totals[top] / totals.sum()
+        text = f"{labels[top]} is the largest group at {fv(totals[top])}."
+        if len(totals) >= 4:
+            three = np.sort(totals)[::-1][:3].sum() / totals.sum()
+            text += f" The top three together make up {three:.0%} of the total."
+        if multi:
+            seg = np.nansum(values, axis=0)
+            if seg.sum() > 0:
+                lead = int(np.argmax(seg))
+                text += f" {res.columns[lead]} is the biggest segment overall ({seg[lead] / seg.sum():.0%})."
+        return f"{share:.0%}", text
+    low = int(np.argmin(totals))
+    if low == top:
+        return None
+    return None, f"{labels[top]} is highest at {fv(totals[top])}. {labels[low]} is lowest at {fv(totals[low])}."
 
 
 def render_kpi(spec, ctx):
@@ -764,6 +855,129 @@ def render_kpi(spec, ctx):
     return card, errors, warns
 
 
+def derived_cards(ctx, summary_specs, days, have):
+    """Extra summary cards so the first summary slide always has a full, symmetric row."""
+    out = []
+    first_sum = next((sp for sp in summary_specs if sp["agg"] == "sum" and sp["y"]), None)
+    candidates = []
+    if first_sum:
+        candidates.append(new_spec(chart_type="kpi", agg="average", y=first_sum["y"],
+                                   title=f"Average {first_sum['y']}"))
+    else:  # no measure was chosen: use the first number column
+        num = next((c for c, m in ctx.info.items() if m["kind"] == "number" and c not in ctx.blocked
+                    and not m["id_like"] and not looks_like_identifier(m)), None)
+        if num:
+            candidates.append(new_spec(chart_type="kpi", agg="sum", y=num, title=f"Total {num}"))
+            candidates.append(new_spec(chart_type="kpi", agg="average", y=num, title=f"Average {num}"))
+    if days:
+        per_day = len(ctx.cur) / days
+        candidates.append({"label": "Records per day", "value": format_value(per_day, "full"),
+                           "small": "", "delta": None})
+    cats = [c for c, m in ctx.info.items()
+            if m["kind"] == "category" and c not in ctx.blocked and 2 <= m["nunique"] <= 50
+            and not looks_like_identifier(m)]
+    for cat in cats[:3]:
+        candidates.append(new_spec(chart_type="kpi", agg="distinct count", y=cat, title=f"Distinct {cat}"))
+    if cats:  # the most common value of the first category, with its share
+        counts = category_key(ctx.cur[cats[0]]).value_counts()
+        if len(counts) and counts.index[0] != BLANK:
+            candidates.append({"label": f"Most common {cats[0]}", "value": str(counts.index[0])[:16],
+                               "small": f"{counts.iloc[0] / len(ctx.cur):.0%} of records", "delta": None})
+    for cand in candidates:
+        if len(out) >= have:
+            break
+        if "label" in cand:
+            out.append(cand)
+            continue
+        card, errors, _ = render_kpi(cand, ctx)
+        if card and not errors and card["value"] != "n/a":
+            card["small"] = ""
+            card["delta"] = None
+            out.append(card)
+    return out
+
+
+def format_period(start, end):
+    if start.year == end.year:
+        return f"{start:%d %b} \u2013 {end:%d %b %Y}"
+    return f"{start:%d %b %Y} \u2013 {end:%d %b %Y}"
+
+
+def kpi_highlights(cards, records, days, chart_slides):
+    """Up to three plain sentences for the highlights panel under the summary cards."""
+    lines = []
+    for card in cards:
+        if card.get("delta") and len(lines) < 2:
+            up = not card["delta"].startswith("-")
+            lines.append(f"{card['label']} is {'up' if up else 'down'} {card['delta'].lstrip('+-')} "
+                         f"compared with the previous period.")
+    for sl in chart_slides:  # the first sentence of the automatic insight of the first charts
+        if len(lines) >= 3:
+            break
+        if sl.get("kind") == "chart" and sl.get("auto_insight"):
+            first = sl["auto_insight"][1].split(". ")[0].rstrip(".") + "."
+            by = sl["frame"].index.name
+            line = first if sl.get("is_date") or not by else f"By {by}: {first}"
+            if line not in lines:
+                lines.append(line)
+    if days and records and len(lines) < 3:
+        lines.append(f"{records:,} records over {days:,} days, about {records / days:,.1f} a day.")
+    return lines
+
+
+def arrange_slides(slides, settings, warns):
+    """Put two charts on one slide where asked, and place the insight callouts."""
+    merged, i = [], 0
+    while i < len(slides):
+        cur = slides[i]
+        nxt = slides[i + 1] if i + 1 < len(slides) else None
+        if cur["kind"] == "chart" and cur.get("pair_next"):
+            if nxt is not None and nxt["kind"] == "chart":
+                title = f"{cur['title']} and {nxt['title']}"
+                merged.append({
+                    "kind": "duo", "title": title, "panels": [cur, nxt],
+                    "section": cur["section"] or nxt["section"], "headline": cur["headline"] or nxt["headline"],
+                    "notes": cur["notes"] or nxt["notes"],
+                    "insight_pos": nxt["insight_pos"] if cur["insight_pos"] == "auto" else cur["insight_pos"],
+                    "footnotes": cur["footnotes"] + [f for f in nxt["footnotes"] if f not in cur["footnotes"]],
+                    "warnings": cur["warnings"] + nxt["warnings"]})
+                cur["warnings"], nxt["warnings"] = [], []
+                i += 2
+                continue
+            warns.append(f"'{cur['title']}' is set to share a slide with the next chart, "
+                         "but that chart is missing or was skipped, so it has its own slide.")
+        merged.append(cur)
+        i += 1
+
+    eligible, cycle = 0, 0
+    for sl in merged:
+        if sl["kind"] not in ("chart", "duo"):
+            continue
+        sl["insight"] = None
+        pos = sl.get("insight_pos", "auto")
+        if pos == "none":
+            continue
+        stat, text = None, (sl.get("notes") or "").strip()
+        if not text and settings["auto_insights"] and sl["kind"] == "chart" and sl.get("auto_insight"):
+            if pos != "auto":              # the person chose a position, so they want the callout
+                stat, text = sl["auto_insight"]
+            else:
+                eligible += 1
+                if eligible % 2 == 1:      # otherwise automatic insights appear on every other chart
+                    stat, text = sl["auto_insight"]
+        if not text:
+            continue
+        if pos == "auto":
+            pos = INSIGHT_CYCLE[cycle % len(INSIGHT_CYCLE)]
+            cycle += 1
+        if sl["kind"] == "duo":            # two charts leave room for a strip only
+            pos = "top" if pos == "top" else "bottom"
+        if stat is not None and len(stat) > 9:
+            stat = None
+        sl["insight"] = {"stat": stat, "text": text, "pos": pos}
+    return merged
+
+
 def build_slides(df, info, settings, specs, today=None):
     """Turn the data, report settings and chart list into finished slide data."""
     today = today or date.today()
@@ -777,7 +991,7 @@ def build_slides(df, info, settings, specs, today=None):
     stats.append(("Rows after row filters", f"{len(base):,}"))
 
     cur, prev, date_col = base, None, s["date_col"]
-    period_text = None
+    period_text, period_days = None, None
     if date_col:
         if date_col not in df.columns:
             warns.append(f"Date column '{date_col}' is not in this file. Dates are ignored.")
@@ -812,20 +1026,21 @@ def build_slides(df, info, settings, specs, today=None):
                         prev_start = prev_end - timedelta(days=length - 1)
                         prev = base[(d >= pd.Timestamp(prev_start)) &
                                     (d < pd.Timestamp(prev_end) + pd.Timedelta(days=1))]
-                inside = d[in_range]
-                if not inside.empty:
-                    period_text = f"{inside.min():%d %b %Y} to {inside.max():%d %b %Y}"
+                period_text = format_period(start, end)
+                period_days = max((end - start).days + 1, 1)
     footer = (s["footer"] or "").replace("{date}", f"{today:%d %b %Y}")
-    result = {"slides": [], "warnings": warns, "stats": stats, "footer": footer, "title": s["title"]}
+    result = {"slides": [], "warnings": warns, "stats": stats, "footer": footer, "title": s["title"],
+              "period": period_text}
     if cur.empty:
         warns.append("No rows are left after the filters and date range.")
         return result
 
     ctx = SimpleNamespace(df=df, info=info, settings=s, conv=conv, cur=cur, prev=prev, blocked=blocked)
-    result["slides"].append({"kind": "title", "title": s["title"],
-                             "subtitle": period_text or f"{len(cur):,} records", "warnings": []})
+    subtitle = f"{period_text}  \u00b7  {len(cur):,} records" if period_text else f"{len(cur):,} records"
+    result["slides"].append({"kind": "title", "title": s["title"], "subtitle": subtitle,
+                             "period": period_text, "warnings": []})
 
-    summary, used_cols = None, set()
+    summary, used_cols, summary_specs = None, set(), []
     for spec in specs:
         if not spec.get("include", True):
             continue
@@ -837,7 +1052,8 @@ def build_slides(df, info, settings, specs, today=None):
             card, errors, kwarns = render_kpi(spec, ctx)
             if summary is None:
                 summary = {"kind": "kpi", "title": "Where we stand", "cards": [], "warnings": [],
-                           "section": "At a glance", "headline": s["summary_headline"], "notes": s["summary_notes"]}
+                           "section": "At a glance", "headline": s["summary_headline"], "notes": s["summary_notes"],
+                           "first": True}
                 result["slides"].append(summary)
             summary["warnings"] += [f"Card '{spec['title'] or auto_title(spec)}': {w}" for w in kwarns]
             if errors:
@@ -846,8 +1062,25 @@ def build_slides(df, info, settings, specs, today=None):
                 summary["warnings"].append(f"Only {MAX_KPI_CARDS} summary cards fit on a slide.")
             else:
                 summary["cards"].append(card)
+                summary_specs.append(spec)
         else:
             result["slides"].append(render_chart(spec, ctx))
+
+    if summary is not None:
+        # The first summary slide always shows four cards, so the row looks balanced.
+        if len(summary["cards"]) < KPI_PER_SLIDE:
+            summary["cards"] += derived_cards(ctx, summary_specs, period_days,
+                                              KPI_PER_SLIDE - len(summary["cards"]))
+        cards = summary["cards"]
+        summary["records"] = len(cur)
+        summary["highlights"] = ([summary["notes"]] if summary["notes"]
+                                 else kpi_highlights(cards, len(cur), period_days, result["slides"]))
+        summary["cards"] = cards[:KPI_PER_SLIDE]
+        slot = result["slides"].index(summary)
+        for n, start_at in enumerate(range(KPI_PER_SLIDE, len(cards), KPI_PER_SLIDE), start=2):
+            extra = {"kind": "kpi", "title": f"Where we stand ({n})", "cards": cards[start_at:start_at + KPI_PER_SLIDE],
+                     "warnings": [], "section": "At a glance", "headline": "", "notes": "", "first": False}
+            result["slides"].insert(slot + n - 1, extra)
 
     if s["quality_slide"]:
         rows = [list(r) for r in stats]
@@ -857,6 +1090,7 @@ def build_slides(df, info, settings, specs, today=None):
                 rows.append([f"Blank values in {col}", f"{n:,} ({n / len(cur):.1%})"])
         result["slides"].append({"kind": "quality", "title": "Data quality", "header": ["Check", "Value"],
                                  "rows": rows[:TABLE_MAX_ROWS + 3], "warnings": []})
+    result["slides"] = arrange_slides(result["slides"], s, warns)
     return result
 
 
@@ -866,6 +1100,7 @@ def build_slides(df, info, settings, specs, today=None):
 
 
 def suggest_specs(df, info, settings):
+    """Automatic chart list: summary cards, a trend, paired breakdowns and one cross view."""
     blocked = set(settings["blocked"])
     specs = [new_spec(chart_type="kpi", agg="count", title="Records")]
     first_small = True
@@ -875,17 +1110,30 @@ def suggest_specs(df, info, settings):
     for m in measures[:3]:
         specs.append(new_spec(chart_type="kpi", agg="sum", y=m, title=f"Total {m}"))
     agg, y = ("sum", measures[0]) if measures else ("count", None)
-    if settings["date_col"]:
-        specs.append(new_spec(chart_type="column", x=settings["date_col"], agg=agg, y=y, section="Trend"))
     cats = [c for c, m in info.items()
             if c not in blocked and c not in measures and 2 <= m["nunique"] <= 15
             and (m["kind"] == "category" or (m["kind"] == "number" and m["nunique"] <= FEW_VALUES))
             and not looks_like_identifier(m)]
-    for c in cats[:6]:
+    splittable = [c for c in cats if info[c]["nunique"] <= MAX_SPLIT]
+    if settings["date_col"]:
+        specs.append(new_spec(chart_type="column", x=settings["date_col"], agg=agg, y=y, section="Trend"))
+        if splittable:  # the same trend, broken down by one category
+            specs.append(new_spec(chart_type="stacked column", x=settings["date_col"], agg=agg, y=y,
+                                  split=splittable[0], section="Trend"))
+    shown = cats[:6]
+    for k, c in enumerate(shown):
         small = info[c]["nunique"] <= PIE_MAX and first_small
         first_small = first_small and not small
+        # charts 1+2, 3+4 and 5+6 share a slide
         specs.append(new_spec(x=c, agg=agg, y=y, section="Breakdown",
-                              chart_type="doughnut" if small else AUTO))
+                              chart_type="doughnut" if small else AUTO,
+                              other_bucket=small, pair_next=(k % 2 == 0 and k + 1 < len(shown))))
+    if len(cats) >= 2:  # a cross view of two categories
+        a, b = cats[0], cats[1]
+        if info[b]["nunique"] <= MAX_SPLIT:
+            a, b = b, a
+        if info[b]["nunique"] <= MAX_SPLIT:
+            specs.append(new_spec(chart_type="heatmap", x=a, split=b, agg=agg, y=y, section="Cross view"))
     return specs
 
 
@@ -899,7 +1147,7 @@ def find_preset(columns):
 def preset_specs(preset, columns):
     specs = []
     for chart in preset["charts"]:
-        needed = [chart.get(k) for k in ("x", "y") if chart.get(k)]
+        needed = [chart.get(k) for k in ("x", "y", "split") if chart.get(k)]
         if all(c in columns for c in needed):
             specs.append(new_spec(**chart))
     return specs
@@ -957,6 +1205,21 @@ def add_text(slide, text, left, top, width, height, size=18, bold=False, color=G
     return box
 
 
+def add_lines(slide, lines, left, top, width, height, size=14, color=INK):
+    """Several short paragraphs (bullets) in one text box."""
+    box = slide.shapes.add_textbox(Inches(left), Inches(top), Inches(width), Inches(height))
+    frame = box.text_frame
+    frame.word_wrap = True
+    for i, line in enumerate(lines):
+        para = frame.paragraphs[0] if i == 0 else frame.add_paragraph()
+        para.space_after = Pt(6)
+        run = para.add_run()
+        run.text = "\u2022  " + line
+        run.font.size = Pt(size)
+        run.font.color.rgb = color
+    return box
+
+
 def card_shape(slide, left, top, width, height, accent=True):
     """White card with a thin border and a green bar on the left, like the dashboard."""
     shape = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(left), Inches(top), Inches(width), Inches(height))
@@ -973,13 +1236,21 @@ def card_shape(slide, left, top, width, height, accent=True):
     return shape
 
 
-def blank_slide(prs, title, footer="", eyebrow="", headline="", number=None):
+# The area under the title where charts, tables and callouts go (inches)
+AREA_L, AREA_T, AREA_W, AREA_H = 0.6, 1.9, 12.1, 4.7
+GAP = 0.2
+
+
+def blank_slide(prs, title, footer="", eyebrow="", headline="", number=None, period=None):
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     slide.background.fill.solid()
     slide.background.fill.fore_color.rgb = PAGE_BG
     if eyebrow:
-        add_text(slide, eyebrow.upper(), 0.6, 0.35, 12, 0.4, size=12, bold=True, color=NAVY)
-    add_text(slide, title, 0.6, 0.65, 12, 0.8, size=30, bold=True, color=INK)
+        add_text(slide, eyebrow.upper(), 0.6, 0.35, 7.5, 0.4, size=12, bold=True, color=NAVY)
+    if period:  # every slide says which dates it covers
+        add_text(slide, f"Period: {period}", 8.2, 0.35, 4.5, 0.4, size=11, bold=True, color=GREY, align=PP_ALIGN.RIGHT)
+    size = 30 if len(title) <= 45 else 24 if len(title) <= 75 else 20
+    add_text(slide, title, 0.6, 0.65, 12, 0.8, size=size, bold=True, color=INK)
     if headline:
         add_text(slide, headline, 0.6, 1.3, 12.1, 0.5, size=15, color=GREY)
     if footer:
@@ -989,22 +1260,31 @@ def blank_slide(prs, title, footer="", eyebrow="", headline="", number=None):
     return slide
 
 
-def commentary_box(slide, text, top, height=1.2):
-    """Space for the written explanation under a chart or the cards."""
-    card_shape(slide, 0.6, top, 12.1, height)
-    add_text(slide, "WHAT THIS SHOWS", 0.8, top + 0.08, 4, 0.3, size=10, bold=True, color=NAVY)
-    add_text(slide, text, 0.8, top + 0.38, 11.7, height - 0.45, size=14, color=INK)
-
-
-def finish(slide, data, notes_top=None):
-    if data.get("notes") and notes_top:
-        commentary_box(slide, data["notes"], notes_top)
+def finish(slide, data):
     if data.get("footnotes"):
         add_text(slide, " ".join(data["footnotes"]), 0.6, 6.7, 12, 0.35, size=10)
 
 
 def eyebrow_for(data, number):
     return f"{number:02d} \u00b7 {data['section']}" if data.get("section") else f"{number:02d}"
+
+
+def insight_box(slide, ins, left, top, width, height):
+    """A small callout: optional big number plus a sentence. Wide boxes lay out sideways."""
+    card_shape(slide, left, top, width, height)
+    add_text(slide, "INSIGHT", left + 0.25, top + 0.08, 3, 0.3, size=10, bold=True, color=NAVY)
+    if width > height * 2:  # strip above or below a chart
+        x = left + 0.25
+        if ins.get("stat"):
+            add_text(slide, ins["stat"], x, top + 0.3, 2.2, max(height - 0.4, 0.5), size=28, bold=True, color=NAVY)
+            x += 2.4
+        add_text(slide, ins["text"], x, top + 0.3, left + width - x - 0.2, max(height - 0.35, 0.5), size=14, color=INK)
+    else:                   # tall panel beside a chart
+        y = top + 0.4
+        if ins.get("stat"):
+            add_text(slide, ins["stat"], left + 0.25, y, width - 0.4, 0.7, size=32, bold=True, color=NAVY)
+            y += 0.85
+        add_text(slide, ins["text"], left + 0.25, y, width - 0.4, max(height - (y - top) - 0.1, 0.5), size=14, color=INK)
 
 
 def add_title_slide(prs, data):
@@ -1015,71 +1295,117 @@ def add_title_slide(prs, data):
     add_text(slide, data["subtitle"], 0.8, 3.9, 11.5, 0.8, size=20, color=RGBColor(0xD8, 0xF0, 0xE8))
 
 
-def add_kpi_slide(prs, data, footer, number):
-    slide = blank_slide(prs, data["title"], footer, eyebrow_for(data, number), data.get("headline", ""), number)
-    cards = data["cards"]
-    two_rows = len(cards) > 4
-    tops = [1.95, 3.75] if two_rows else [2.0]
+def value_size(text):
+    return 32 if len(text) <= 10 else 26 if len(text) <= 14 else 20
+
+
+def add_kpi_slide(prs, data, footer, number, period):
+    slide = blank_slide(prs, data["title"], footer, eyebrow_for(data, number), data.get("headline", ""), number, period)
+    cards = data["cards"][:KPI_PER_SLIDE]
+    card_w = (AREA_W - GAP * (KPI_PER_SLIDE - 1)) / KPI_PER_SLIDE
+    used = len(cards) * card_w + (len(cards) - 1) * GAP
+    left0 = AREA_L + (AREA_W - used) / 2          # fewer than four cards stay centred
+    top, card_h = AREA_T + 0.05, 1.9
+    big = min([value_size(c["value"]) for c in cards] or [32])  # one size for the whole row
     for i, card in enumerate(cards):
-        left = 0.6 + (i % 4) * 3.05
-        top = tops[i // 4]
-        card_shape(slide, left, top, 2.85, 1.6)
-        add_text(slide, card["label"], left + 0.2, top + 0.1, 2.55, 0.4, size=12, bold=True, color=GREY)
-        add_text(slide, card["value"], left + 0.2, top + 0.45, 2.55, 0.7, size=28, bold=True, color=INK)
+        left = left0 + i * (card_w + GAP)
+        card_shape(slide, left, top, card_w, card_h)
+        add_text(slide, card["label"], left + 0.2, top + 0.15, card_w - 0.3, 0.4, size=13, bold=True, color=GREY)
+        add_text(slide, card["value"], left + 0.2, top + 0.6, card_w - 0.3, 0.8, size=big, bold=True, color=INK)
         if card["small"]:
             down = (card.get("delta") or "").startswith("-")
             arrow = ("\u25bc " if down else "\u25b2 ") if card.get("delta") else ""
-            add_text(slide, arrow + card["small"], left + 0.2, top + 1.15, 2.55, 0.4, size=11, bold=True,
+            add_text(slide, arrow + card["small"], left + 0.2, top + 1.4, card_w - 0.3, 0.4, size=11, bold=True,
                      color=RED if down else NAVY)
-    if data.get("notes"):
-        commentary_box(slide, data["notes"], 5.5 if two_rows else 4.0, 1.4)
+    if data.get("first"):  # lower row: the period on the left, a few highlights on the right
+        row_top, row_h = top + card_h + 0.3, 2.35
+        records = f"{data.get('records', 0):,} records included"
+        lines = data.get("highlights") or []
+        left_w = 4.0 if lines else AREA_W
+        card_shape(slide, AREA_L, row_top, left_w, row_h)
+        add_text(slide, "REPORTING PERIOD", AREA_L + 0.25, row_top + 0.12, 3, 0.3, size=10, bold=True, color=NAVY)
+        add_text(slide, period or "All records", AREA_L + 0.25, row_top + 0.55, left_w - 0.4, 0.9,
+                 size=22 if period else 26, bold=True, color=INK)
+        add_text(slide, records, AREA_L + 0.25, row_top + 1.55, left_w - 0.4, 0.4, size=13, color=GREY)
+        if lines:
+            right_left = AREA_L + left_w + GAP
+            card_shape(slide, right_left, row_top, AREA_W - left_w - GAP, row_h)
+            add_text(slide, "HIGHLIGHTS", right_left + 0.25, row_top + 0.12, 3, 0.3, size=10, bold=True, color=NAVY)
+            add_lines(slide, lines, right_left + 0.25, row_top + 0.5, AREA_W - left_w - GAP - 0.5, row_h - 0.6)
+    finish(slide, data)
 
 
-def add_table_slide(prs, data, footer, number):
-    slide = blank_slide(prs, data["title"], footer, eyebrow_for(data, number), data.get("headline", ""), number)
+def shade(fraction):
+    """Light mint to the main green, for heatmap cells."""
+    lo, hi = (0xE6, 0xF4, 0xEE), (0x0E, 0x7C, 0x61)
+    return RGBColor(*[int(a + (b - a) * fraction) for a, b in zip(lo, hi)])
+
+
+def add_table_slide(prs, data, footer, number, period):
+    slide = blank_slide(prs, data["title"], footer, eyebrow_for(data, number), data.get("headline", ""), number, period)
+    heat = data["kind"] == "heatmap"
     rows, cols = len(data["rows"]) + 1, len(data["header"])
-    table = slide.shapes.add_table(rows, cols, Inches(0.6), Inches(1.9), Inches(12.1), Inches(0.3 * rows)).table
+    row_h = min(0.45 if heat else 0.4, 4.5 / rows)
+    table = slide.shapes.add_table(rows, cols, Inches(AREA_L), Inches(AREA_T), Inches(AREA_W),
+                                   Inches(row_h * rows)).table
+    values = data["frame"].to_numpy(dtype=float) if heat else None
+    low = np.nanmin(values) if heat and np.isfinite(values).any() else 0
+    high = np.nanmax(values) if heat and np.isfinite(values).any() else 1
+    font = 12 if row_h >= 0.3 else 10
     for r, row in enumerate([data["header"]] + data["rows"]):
-        table.rows[r].height = Inches(0.3)
+        table.rows[r].height = Inches(row_h)
         for c, text in enumerate(row):
             cell = table.cell(r, c)
             cell.text = str(text)
             para = cell.text_frame.paragraphs[0]
-            para.runs[0].font.size = Pt(12)
+            para.runs[0].font.size = Pt(font)
             cell.fill.solid()
             if r == 0:
                 para.runs[0].font.bold = True
                 para.runs[0].font.color.rgb = WHITE
                 cell.fill.fore_color.rgb = NAVY
+            elif heat and c > 0:
+                v = values[r - 1][c - 1]
+                frac = 0.0 if np.isnan(v) else ((v - low) / (high - low) if high > low else 0.5)
+                cell.fill.fore_color.rgb = shade(frac)
+                para.runs[0].font.color.rgb = WHITE if frac > 0.55 else INK
+                para.alignment = PP_ALIGN.CENTER
             else:
+                para.runs[0].font.bold = heat
                 para.runs[0].font.color.rgb = INK
-                cell.fill.fore_color.rgb = LIGHT if r % 2 else PAGE_BG
-    finish(slide, data, notes_top=None)
+                cell.fill.fore_color.rgb = LIGHT if (heat or r % 2) else PAGE_BG
+    if heat:
+        add_text(slide, "Darker cells mean higher values.", AREA_L, AREA_T + row_h * rows + 0.1, 6, 0.3, size=11)
+    finish(slide, data)
 
 
-def add_chart_slide(prs, data, footer, number):
-    slide = blank_slide(prs, data["title"], footer, eyebrow_for(data, number), data.get("headline", ""), number)
+def draw_chart(slide, data, left, top, width, height, panel_title=None, compact=False):
+    """One native PowerPoint chart on a white card, filling the given rectangle."""
     ctype = data["chart_type"]
     cats = list(data["categories"])
     series = [(n, list(v)) for n, v in data["series"]]
-    if ctype in ("bar", "stacked bar"):  # bar charts draw bottom-up, so flip to keep the order
+    if ctype in HORIZONTAL:  # bar charts draw bottom-up, so flip to keep the order
         cats = cats[::-1]
         series = [(n, v[::-1]) for n, v in series]
     chart_data = CategoryChartData()
     chart_data.categories = cats
     for name, vals in series:
         chart_data.add_series(name, [None if pd.isna(v) else float(v) for v in vals])
-    has_notes = bool(data["notes"])
-    height = 3.3 if has_notes else 4.7
-    card_shape(slide, 0.6, 1.9, 12.1, height + 0.2, accent=False)
-    chart = slide.shapes.add_chart(PPTX_TYPES[ctype], Inches(0.75), Inches(2.0),
-                                   Inches(11.8), Inches(height), chart_data).chart
+    card_shape(slide, left, top, width, height, accent=False)
+    inner_top, inner_h = top + 0.1, height - 0.2
+    if panel_title:
+        add_text(slide, panel_title, left + 0.2, top + 0.08, width - 0.4, 0.4, size=14, bold=True, color=INK)
+        inner_top += 0.45
+        inner_h -= 0.45
+    font = 10 if compact else 12
+    chart = slide.shapes.add_chart(PPTX_TYPES[ctype], Inches(left + 0.15), Inches(inner_top),
+                                   Inches(width - 0.3), Inches(inner_h), chart_data).chart
     chart.has_title = False
     chart.has_legend = len(series) > 1 or ctype in ("pie", "doughnut")
     if chart.has_legend:
         chart.legend.position = XL_LEGEND_POSITION.BOTTOM
         chart.legend.include_in_layout = False
-        chart.legend.font.size = Pt(12)
+        chart.legend.font.size = Pt(font)
     plot = chart.plots[0]
     if ctype in ("pie", "doughnut"):
         for i in range(len(cats)):
@@ -1089,26 +1415,76 @@ def add_chart_slide(prs, data, footer, number):
     else:
         for i, ser in enumerate(plot.series):
             color = SERIES_COLORS[i % len(SERIES_COLORS)]
-            if ctype in ("line",):
+            if ctype == "line":
                 ser.format.line.color.rgb = color
             else:
                 ser.format.fill.solid()
                 ser.format.fill.fore_color.rgb = color
-    if data["show_labels"]:
+    show_labels = data["show_labels"] and not (compact and (len(cats) > 8 or len(series) > 3))
+    if show_labels:
         plot.has_data_labels = True
         plot.data_labels.number_format = data["number_format"]
         plot.data_labels.number_format_is_linked = False
-        plot.data_labels.font.size = Pt(12)
+        plot.data_labels.font.size = Pt(font)
+        if ctype in STACKED and ctype != "stacked area":  # labels sit inside the segments
+            for i, ser in enumerate(plot.series):
+                labels = ser.data_labels
+                labels.show_value = True
+                labels.number_format = data["number_format"]
+                labels.number_format_is_linked = False
+                labels.font.size = Pt(font)
+                labels.font.color.rgb = INK if i % len(SERIES_COLORS) in LIGHT_SERIES else WHITE
     if ctype not in ("pie", "doughnut"):
         for axis in (chart.category_axis, chart.value_axis):
-            axis.tick_labels.font.size = Pt(12)
-        chart.value_axis.tick_labels.number_format = data["number_format"]
+            axis.tick_labels.font.size = Pt(font)
+        chart.value_axis.tick_labels.number_format = "0%" if ctype.startswith("100%") else data["number_format"]
         chart.value_axis.tick_labels.number_format_is_linked = False
         chart.value_axis.has_major_gridlines = bool(data["gridlines"])
         all_values = [v for _, vals in series for v in vals if v is not None and not pd.isna(v)]
         if ctype in KEEP_ZERO_TYPES and all_values and min(all_values) >= 0:
             chart.value_axis.minimum_scale = 0  # keep bars honest
-    finish(slide, data, notes_top=5.5)
+
+
+def add_chart_slide(prs, data, footer, number, period):
+    slide = blank_slide(prs, data["title"], footer, eyebrow_for(data, number), data.get("headline", ""), number, period)
+    ins = data.get("insight")
+    L, T, W, H = AREA_L, AREA_T, AREA_W, AREA_H
+    side = 3.2                                    # width of a callout beside the chart
+    pos = ins["pos"] if ins else None
+    if pos == "right":
+        draw_chart(slide, data, L, T, W - side - GAP, H)
+        insight_box(slide, ins, L + W - side, T, side, H)
+    elif pos == "left":
+        insight_box(slide, ins, L, T, side, H)
+        draw_chart(slide, data, L + side + GAP, T, W - side - GAP, H)
+    elif pos == "top":
+        insight_box(slide, ins, L, T, W, 1.1)
+        draw_chart(slide, data, L, T + 1.1 + GAP, W, H - 1.1 - GAP)
+    elif pos == "bottom":
+        draw_chart(slide, data, L, T, W, H - 1.2 - GAP)
+        insight_box(slide, ins, L, T + H - 1.2, W, 1.2)
+    else:
+        draw_chart(slide, data, L, T, W, H)
+    finish(slide, data)
+
+
+def add_duo_slide(prs, data, footer, number, period):
+    """Two charts side by side, with an optional callout strip above or below."""
+    slide = blank_slide(prs, data["title"], footer, eyebrow_for(data, number), data.get("headline", ""), number, period)
+    ins = data.get("insight")
+    L, T, W, H = AREA_L, AREA_T, AREA_W, AREA_H
+    panel_w = (W - GAP) / 2
+    chart_top, chart_h = T, H
+    if ins and ins["pos"] == "top":
+        insight_box(slide, ins, L, T, W, 1.0)
+        chart_top, chart_h = T + 1.0 + GAP, H - 1.0 - GAP
+    elif ins:
+        chart_h = H - 1.1 - GAP
+        insight_box(slide, ins, L, T + chart_h + GAP, W, 1.1)
+    for i, panel in enumerate(data["panels"]):
+        draw_chart(slide, panel, L + i * (panel_w + GAP), chart_top, panel_w, chart_h,
+                   panel_title=panel["title"], compact=True)
+    finish(slide, data)
 
 
 def write_pptx(result):
@@ -1117,6 +1493,7 @@ def write_pptx(result):
     prs.slide_width = Inches(13.333)  # 16:9
     prs.slide_height = Inches(7.5)
     footer = result["footer"]
+    period = result.get("period")
     number = 0
     for data in result["slides"]:
         kind = data["kind"]
@@ -1127,14 +1504,17 @@ def write_pptx(result):
             continue
         number += 1
         if kind == "kpi":
-            add_kpi_slide(prs, data, footer, number)
-        elif kind in ("table", "quality"):
-            add_table_slide(prs, data, footer, number)
+            add_kpi_slide(prs, data, footer, number, period)
+        elif kind in ("table", "quality", "heatmap"):
+            add_table_slide(prs, data, footer, number, period)
         elif kind == "chart":
-            add_chart_slide(prs, data, footer, number)
+            add_chart_slide(prs, data, footer, number, period)
+        elif kind == "duo":
+            add_duo_slide(prs, data, footer, number, period)
     buffer = io.BytesIO()
     prs.save(buffer)
     return buffer.getvalue()
+
 
 
 # ===========================================================================
@@ -1153,6 +1533,9 @@ div[data-testid="stVerticalBlockBorderWrapper"] { background: #FFFFFF; }
 .stButton > button, .stDownloadButton > button { background: #0E7C61; color: #FFFFFF; border: 0; }
 .stButton > button:hover, .stDownloadButton > button:hover { background: #0A5F4A; color: #FFFFFF; }
 section[data-testid="stSidebar"] { background: #E6EEEA; }
+.insight { border-left: 4px solid #0E7C61; background: #FFFFFF; padding: 0.7rem 0.9rem; border-radius: 4px; margin: 0.5rem 0; }
+.insight b { color: #0E7C61; font-size: 0.75rem; letter-spacing: 0.06em; }
+.insight .stat { font-size: 1.9rem; font-weight: 700; color: #0E7C61; line-height: 1.25; }
 </style>
 """
 
@@ -1188,6 +1571,11 @@ def cached_date_check(_df, sig, col):
 @st.cache_data(show_spinner="Building slides...")
 def cached_build(_df, _info, sig, settings_json, specs_json, today_iso):
     return build_slides(_df, _info, json.loads(settings_json), json.loads(specs_json), date.fromisoformat(today_iso))
+
+
+@st.cache_data(show_spinner="Building PowerPoint...")
+def cached_deck(_result, key):
+    return write_pptx(_result)
 
 
 def pick_index(options, value, default=0):
@@ -1295,7 +1683,15 @@ def chart_card(idx, spec, df, info, settings, total):
                 spec["gridlines"] = c3.checkbox("Gridlines", spec["gridlines"], key=kp + "grid")
                 spec["section"] = c1.text_input("Section label (e.g. Linkage campaign)", spec["section"], key=kp + "section")
                 spec["headline"] = st.text_input("Headline under the title (optional)", spec["headline"], key=kp + "headline")
-                spec["notes"] = st.text_area("Explanation shown under the chart (optional)", spec["notes"], key=kp + "notes", height=90)
+                st.markdown("**Layout and insight**")
+                spec["pair_next"] = st.checkbox("Put this chart and the next one on the same slide", spec["pair_next"],
+                                                key=kp + "pair", help="Works when the next chart is also a chart (not a table or heatmap).")
+                spec["insight_pos"] = st.selectbox(
+                    "Where the insight callout goes", INSIGHT_POSITIONS,
+                    index=pick_index(INSIGHT_POSITIONS, spec["insight_pos"]), key=kp + "inspos",
+                    help="auto varies the position from slide to slide. none turns the callout off for this chart.")
+                spec["notes"] = st.text_area("Insight text (leave empty for an automatic one on some slides)",
+                                             spec["notes"], key=kp + "notes", height=90)
 
             st.markdown("**Filter for this chart only**")
             filter_editor(spec["filters"], df, kp + "f")
@@ -1312,9 +1708,12 @@ def chart_card(idx, spec, df, info, settings, total):
                 action = "delete"
 
         label = spec["title"] or auto_title(spec)
-        head_box.markdown(f"**{idx + 1}. {label}**  \n"
-                          f"{spec['chart_type'] if spec['x'] else 'summary card'}"
-                          f"{'' if spec['include'] else '  (off)'}")
+        kind_text = spec["chart_type"] if spec["x"] else "summary card"
+        if spec["x"] and spec.get("pair_next"):
+            kind_text += " \u00b7 shares a slide with the next chart"
+        if not spec["include"]:
+            kind_text += " (off)"
+        head_box.markdown(f"**{idx + 1}. {label}**  \n{kind_text}")
     return action
 
 
@@ -1327,6 +1726,8 @@ def vega_spec(slide):
     percent = slide["fmt_name"] == "percent of total"
     value_axis = {"field": "value", "type": "quantitative", "title": None,
                   "axis": {"format": ".0%" if percent else ",.2~f"}}
+    if ctype.startswith("100%"):
+        value_axis = {**value_axis, "stack": "normalize", "axis": {"format": ".0%"}}
     label_axis = {"field": "label", "type": "nominal", "sort": order, "title": None}
     multi = frame.shape[1] > 1
     if ctype in ("pie", "doughnut"):
@@ -1335,11 +1736,14 @@ def vega_spec(slide):
                              "color": {"field": "label", "type": "nominal", "sort": order}}}
     else:
         mark = {"line": {"type": "line", "point": True, "color": HEX_COLORS[0]},
-                "area": {"type": "area", "color": HEX_COLORS[0]}}.get(ctype, {"type": "bar", "color": HEX_COLORS[0]})
-        horizontal = ctype in ("bar", "stacked bar")
+                "area": {"type": "area", "color": HEX_COLORS[0]},
+                "stacked area": {"type": "area", "color": HEX_COLORS[0]}}.get(ctype, {"type": "bar", "color": HEX_COLORS[0]})
+        horizontal = ctype in HORIZONTAL
         enc = {"x": value_axis, "y": label_axis} if horizontal else {"x": label_axis, "y": value_axis}
         if multi:
             enc["color"] = {"field": "series", "type": "nominal", "legend": {"title": None}}
+            if ctype in GROUPED:  # side-by-side bars instead of stacked ones
+                enc["yOffset" if horizontal else "xOffset"] = {"field": "series", "type": "nominal"}
         spec = {"mark": mark, "encoding": enc}
     scale = {"range": HEX_COLORS}
     if "color" in spec["encoding"]:
@@ -1347,7 +1751,61 @@ def vega_spec(slide):
     return long, spec
 
 
-def show_slide_preview(slide):
+def vega_heatmap(slide):
+    """A shaded grid for the preview, matching the heatmap slide."""
+    frame = slide["frame"]
+    long = frame.rename_axis("label").reset_index().melt(id_vars="label", var_name="series", value_name="value")
+    values = long["value"].dropna()
+    low, high = (values.min(), values.max()) if len(values) else (0, 1)
+    threshold = low + 0.55 * (high - low)
+    percent = slide["fmt_name"] == "percent of total"
+    spec = {"height": 34 * len(frame.index) + 40,
+            "encoding": {"x": {"field": "series", "type": "ordinal", "sort": list(frame.columns), "title": None,
+                               "axis": {"orient": "top", "labelAngle": 0}},
+                         "y": {"field": "label", "type": "ordinal", "sort": list(frame.index), "title": None}},
+            "layer": [{"mark": "rect",
+                       "encoding": {"color": {"field": "value", "type": "quantitative", "legend": None,
+                                              "scale": {"range": ["#E6F4EE", HEX_COLORS[0]]}}}},
+                      {"mark": "text",
+                       "encoding": {"text": {"field": "value", "type": "quantitative",
+                                             "format": ".0%" if percent else ",.2~f"},
+                                    "color": {"condition": {"test": f"datum.value > {threshold}", "value": "white"},
+                                              "value": "#1A2B25"}}}]}
+    return long, spec
+
+
+def insight_html(ins):
+    stat = f"<div class='stat'>{html.escape(ins['stat'])}</div>" if ins.get("stat") else ""
+    return f"<div class='insight'><b>INSIGHT</b>{stat}<div>{html.escape(ins['text'])}</div></div>"
+
+
+def draw_preview_chart(slide, heading=None):
+    if heading:
+        st.markdown(f"**{heading}**")
+    long, spec = vega_spec(slide)
+    st.vega_lite_chart(long, spec, use_container_width=True)
+    with st.expander("Data behind this chart"):
+        st.dataframe(slide["frame"])
+
+
+def with_insight(draw, ins):
+    """Draw something and place the insight callout around it, like the slide does."""
+    pos = ins["pos"] if ins else None
+    if pos in ("right", "left"):
+        left, right = st.columns([3, 1] if pos == "right" else [1, 3])
+        chart_col, ins_col = (left, right) if pos == "right" else (right, left)
+        with chart_col:
+            draw()
+        ins_col.markdown(insight_html(ins), unsafe_allow_html=True)
+        return
+    if pos == "top":
+        st.markdown(insight_html(ins), unsafe_allow_html=True)
+    draw()
+    if pos == "bottom":
+        st.markdown(insight_html(ins), unsafe_allow_html=True)
+
+
+def show_slide_preview(slide, period=None):
     kind = slide["kind"]
     with st.container(border=True):
         if kind == "title":
@@ -1365,20 +1823,35 @@ def show_slide_preview(slide):
         for w in slide["warnings"]:
             st.warning(w)
         if kind == "kpi":
-            cols = st.columns(4)
+            cols = st.columns(KPI_PER_SLIDE)
             for i, card in enumerate(slide["cards"]):
-                cols[i % 4].metric(card["label"], card["value"], card["delta"])
+                cols[i % KPI_PER_SLIDE].metric(card["label"], card["value"], card["delta"])
+            if slide.get("first"):
+                lines = "".join(f"<li>{html.escape(t)}</li>" for t in slide.get("highlights") or [])
+                st.markdown(f"<div class='insight'><b>REPORTING PERIOD</b><div class='stat'>{html.escape(period or 'All records')}</div>"
+                            f"<div>{slide.get('records', 0):,} records included</div></div>", unsafe_allow_html=True)
+                if lines:
+                    st.markdown(f"<div class='insight'><b>HIGHLIGHTS</b><ul>{lines}</ul></div>", unsafe_allow_html=True)
         elif kind in ("table", "quality"):
             st.dataframe(pd.DataFrame(slide["rows"], columns=slide["header"]), hide_index=True)
-        elif kind == "chart":
-            long, spec = vega_spec(slide)
+        elif kind == "heatmap":
+            long, spec = vega_heatmap(slide)
             st.vega_lite_chart(long, spec, use_container_width=True)
-            with st.expander("Data behind this chart"):
-                st.dataframe(slide["frame"])
+        elif kind == "chart":
+            with_insight(lambda: draw_preview_chart(slide), slide.get("insight"))
+        elif kind == "duo":
+            def draw_pair():
+                left, right = st.columns(2)
+                with left:
+                    draw_preview_chart(slide["panels"][0], slide["panels"][0]["title"])
+                with right:
+                    draw_preview_chart(slide["panels"][1], slide["panels"][1]["title"])
+            with_insight(draw_pair, slide.get("insight"))
         for note in slide.get("footnotes", []):
             st.caption(note)
-        if slide.get("notes"):
-            st.markdown(f"<div class='note'><b>WHAT THIS SHOWS</b><br>{slide['notes']}</div>", unsafe_allow_html=True)
+        if slide.get("notes") and kind in ("table", "heatmap"):
+            st.markdown(f"<div class='note'><b>WHAT THIS SHOWS</b><br>{html.escape(slide['notes'])}</div>",
+                        unsafe_allow_html=True)
 
 
 def main():
@@ -1471,93 +1944,85 @@ def main():
                                         cfg_n=st.session_state["cfg_n"] + 1)
                 st.rerun()
 
-    with st.sidebar:
-        st.header("Not allowed on a slide")
-        settings["blocked"] = st.multiselect(
-            "Columns never allowed on a slide", cols, format_func=tag, key=f"{ver}|blocked",
-            default=[c for c in settings["blocked"] if c in cols],
-            help="Blocked columns cannot be used to group or split a chart. Names, IDs, phones and emails are ticked for you.")
+    tab_report, tab_charts, tab_preview = st.tabs(["1. Report", "2. Charts", "3. Preview"])
 
-    tab_rules, tab_report, tab_charts, tab_preview = st.tabs(
-        ["1. Data rules", "2. Report settings", "3. Charts", "4. Preview and download"])
-
-    # ---- Tab 1: what can enter the report ----
-    with tab_rules:
-        st.caption("These rules apply before anything else. Slides only ever show totals and counts.")
-        st.markdown("**Date range**")
-        date_options = [NO_COL] + cols
-        chosen = st.selectbox("Date column", date_options, index=pick_index(date_options, settings["date_col"]),
-                              format_func=lambda c: c if c == NO_COL else tag(c), key=f"{ver}|datecol")
-        settings["date_col"] = None if chosen == NO_COL else chosen
-        if settings["date_col"]:
-            status, msg, lo, hi = cached_date_check(df, sig, settings["date_col"])
-            if status == "block":
-                st.error(f"{msg} Dates will be ignored.")
-            else:
-                if status == "warn":
-                    st.warning(msg)
-                settings["date_preset"] = st.selectbox(
-                    "Show data for", DATE_PRESETS, index=pick_index(DATE_PRESETS, settings["date_preset"]),
-                    key=f"{ver}|preset")
-                if settings["date_preset"] == "Custom":
-                    start = max(to_date(settings["start"]) or lo, lo)
-                    end = min(to_date(settings["end"]) or hi, hi)
-                    picked = st.date_input("From and to", (start, max(start, end)), min_value=lo, max_value=hi,
-                                           key=f"{ver}|range")
-                    if len(picked) == 2:
-                        settings["start"], settings["end"] = picked[0].isoformat(), picked[1].isoformat()
-                st.caption(f"Data runs from {lo:%d %b %Y} to {hi:%d %b %Y}.")
-        st.divider()
-        c1, c2 = st.columns(2)
-        settings["min_group"] = c1.number_input(
-            "Smallest group allowed on a slide (0 = off)", 0, 100, int(settings["min_group"]), key=f"{ver}|mingroup",
-            help="Groups with fewer records than this are merged into Other or hidden, to protect individuals.")
-        settings["suppress_mode"] = c2.selectbox(
-            "Small groups are", SUPPRESS_MODES, index=pick_index(SUPPRESS_MODES, settings["suppress_mode"]),
-            key=f"{ver}|suppress")
-        st.markdown("**Row filters** (apply to every chart)")
-        st.caption("Example: Status, include only, Approved and Disbursed. Or exclude test accounts.")
-        filter_editor(settings["filters"], df, f"{ver}|gf")
-
-    # ---- Tab 2: report-level settings ----
+    # ---- Tab 1: the few settings most people need ----
     with tab_report:
         c1, c2 = st.columns(2)
         settings["title"] = c1.text_input("Report title", settings["title"], key=f"{ver}|title")
-        settings["currency"] = c2.text_input("Currency label (optional)", settings["currency"], key=f"{ver}|currency")
-        settings["footer"] = st.text_input("Footer on every slide (optional, {date} becomes today)",
-                                           settings["footer"], key=f"{ver}|footer")
-        settings["quality_slide"] = st.checkbox("Add a data quality slide at the end",
-                                                settings["quality_slide"], key=f"{ver}|quality")
+        settings["currency"] = c2.text_input("Currency (optional)", settings["currency"], key=f"{ver}|currency")
 
-        st.markdown("**Summary slide text**")
-        settings["summary_headline"] = st.text_input("Headline under the summary title (optional)",
-                                                     settings["summary_headline"], key=f"{ver}|sumhead")
-        settings["summary_notes"] = st.text_area("Explanation under the summary cards (optional)",
-                                                 settings["summary_notes"], key=f"{ver}|sumnotes", height=90)
-        st.markdown("**Dates** (column and range are chosen in the sidebar)")
-        if settings["date_col"]:
-            status, msg, lo, hi = cached_date_check(df, sig, settings["date_col"])
-            if status != "block":
-                c1, c2 = st.columns(2)
-                settings["grain"] = c1.selectbox("Time grain for trend charts", GRAINS,
-                                                 index=pick_index(GRAINS, settings["grain"]), key=f"{ver}|grain")
-                settings["undated"] = c2.selectbox("Rows with no date", UNDATED_MODES,
-                                                   index=pick_index(UNDATED_MODES, settings["undated"]),
-                                                   key=f"{ver}|undated")
+        with st.container(border=True):
+            st.markdown("**Reporting period**")
+            date_options = [NO_COL] + cols
+            d1, d2, d3 = st.columns(3)
+            chosen = d1.selectbox("Date column", date_options, index=pick_index(date_options, settings["date_col"]),
+                                  format_func=lambda c: c if c == NO_COL else tag(c), key=f"{ver}|datecol")
+            settings["date_col"] = None if chosen == NO_COL else chosen
+            if settings["date_col"]:
+                status, msg, lo, hi = cached_date_check(df, sig, settings["date_col"])
+                if status == "block":
+                    st.error(f"{msg} Dates will be ignored.")
+                else:
+                    if status == "warn":
+                        st.warning(msg)
+                    settings["date_preset"] = d2.selectbox(
+                        "Show data for", DATE_PRESETS, index=pick_index(DATE_PRESETS, settings["date_preset"]),
+                        format_func=lambda p: CUSTOM_LABEL if p == "Custom" else p, key=f"{ver}|preset")
+                    settings["grain"] = d3.selectbox("Time grain", GRAINS, index=pick_index(GRAINS, settings["grain"]),
+                                                     key=f"{ver}|grain")
+                    if settings["date_preset"] == "Custom":
+                        start = max(to_date(settings["start"]) or lo, lo)
+                        end = min(to_date(settings["end"]) or hi, hi)
+                        picked = st.date_input("Custom dates: pick a start and an end date",
+                                               (start, max(start, end)), min_value=lo, max_value=hi, key=f"{ver}|range")
+                        if len(picked) == 2:
+                            settings["start"], settings["end"] = picked[0].isoformat(), picked[1].isoformat()
+                    st.caption(f"Data runs from {lo:%d %b %Y} to {hi:%d %b %Y}.")
+            else:
+                st.caption("Pick a date column to choose a reporting period, including custom start and end dates.")
+
+        with st.expander("Privacy and filters"):
+            settings["blocked"] = st.multiselect(
+                "Columns to keep off the slides", cols, format_func=tag, key=f"{ver}|blocked",
+                default=[c for c in settings["blocked"] if c in cols],
+                help="Names, IDs, phones and emails are picked for you.")
+            c1, c2 = st.columns(2)
+            settings["min_group"] = c1.number_input(
+                "Hide groups smaller than (0 = off)", 0, 100, int(settings["min_group"]), key=f"{ver}|mingroup")
+            settings["suppress_mode"] = c2.selectbox(
+                "Small groups are", SUPPRESS_MODES, index=pick_index(SUPPRESS_MODES, settings["suppress_mode"]),
+                key=f"{ver}|suppress")
+            st.markdown("**Row filters** (apply to every chart)")
+            filter_editor(settings["filters"], df, f"{ver}|gf")
+
+        with st.expander("More options"):
+            settings["footer"] = st.text_input("Footer on every slide ({date} becomes today)",
+                                               settings["footer"], key=f"{ver}|footer")
+            settings["quality_slide"] = st.checkbox("Add a data quality slide",
+                                                    settings["quality_slide"], key=f"{ver}|quality")
+            settings["auto_insights"] = st.checkbox("Add automatic insight callouts on some chart slides",
+                                                    settings["auto_insights"], key=f"{ver}|autoins")
+            settings["summary_headline"] = st.text_input("Summary slide headline",
+                                                         settings["summary_headline"], key=f"{ver}|sumhead")
+            settings["summary_notes"] = st.text_area("Summary slide explanation",
+                                                     settings["summary_notes"], key=f"{ver}|sumnotes", height=90)
+            if settings["date_col"]:
                 settings["fill_empty"] = st.checkbox("Show empty periods as zero", settings["fill_empty"],
                                                      key=f"{ver}|fill")
-                settings["compare_prev"] = st.checkbox(
-                    "Compare summary cards to the previous period (same length, just before)",
-                    settings["compare_prev"], key=f"{ver}|compare")
-                with st.expander("Week and fiscal year options"):
-                    settings["week_start"] = st.selectbox("Week starts on", DAY_NAMES,
-                                                          index=pick_index(DAY_NAMES, settings["week_start"]),
-                                                          key=f"{ver}|weekstart")
-                    month = st.selectbox("Fiscal year starts in", MONTH_NAMES,
-                                         index=int(settings["fiscal_start"]) - 1, key=f"{ver}|fiscal")
-                    settings["fiscal_start"] = MONTH_NAMES.index(month) + 1
+                settings["compare_prev"] = st.checkbox("Compare summary cards to the previous period",
+                                                       settings["compare_prev"], key=f"{ver}|compare")
+                settings["undated"] = st.selectbox("Rows with no date", UNDATED_MODES,
+                                                   index=pick_index(UNDATED_MODES, settings["undated"]),
+                                                   key=f"{ver}|undated")
+                settings["week_start"] = st.selectbox("Week starts on", DAY_NAMES,
+                                                      index=pick_index(DAY_NAMES, settings["week_start"]),
+                                                      key=f"{ver}|weekstart")
+                month = st.selectbox("Fiscal year starts in", MONTH_NAMES,
+                                     index=int(settings["fiscal_start"]) - 1, key=f"{ver}|fiscal")
+                settings["fiscal_start"] = MONTH_NAMES.index(month) + 1
 
-    # ---- Tab 3: the chart list ----
+    # ---- Tab 2: the chart list ----
     with tab_charts:
         c1, c2, c3 = st.columns([1, 1, 4])
         if c1.button("Suggest charts"):
@@ -1586,31 +2051,28 @@ def main():
             if action:
                 st.rerun()
 
-    # ---- Tab 4: preview and download ----
+    # ---- Tab 3: preview ----
+    key_settings = json.dumps(settings, sort_keys=True, default=str)
+    key_specs = json.dumps(specs, sort_keys=True, default=str)
+    result = cached_build(df, info, sig, key_settings, key_specs, date.today().isoformat())
+    n_slides = sum(1 for s in result["slides"] if s["kind"] != "skipped")
+
     with tab_preview:
-        key_settings = json.dumps(settings, sort_keys=True, default=str)
-        key_specs = json.dumps(specs, sort_keys=True, default=str)
-        result = cached_build(df, info, sig, key_settings, key_specs, date.today().isoformat())
         for w in result["warnings"]:
             st.warning(w)
         with st.expander("What went into this report"):
             st.dataframe(pd.DataFrame(result["stats"], columns=["Check", "Value"]), hide_index=True)
-        n_slides = sum(1 for s in result["slides"] if s["kind"] != "skipped")
-        st.metric("Slides in the deck", n_slides)
         for slide in result["slides"]:
-            show_slide_preview(slide)
+            show_slide_preview(slide, result["period"])
 
+    # Download is always in the sidebar, whichever tab you are on
+    with st.sidebar:
+        st.header("Download")
+        st.caption(f"{n_slides} slides")
         if n_slides:
-            deck_key = key_settings + key_specs + sig
-            if st.button("Build PowerPoint"):
-                st.session_state["deck"] = (deck_key, write_pptx(result))
-            deck = st.session_state.get("deck")
-            if deck and deck[0] == deck_key:
-                st.download_button(
-                    "Download PowerPoint", deck[1], file_name="report.pptx",
-                    mime="application/vnd.openxmlformats-officedocument.presentationml.presentation")
-            elif deck:
-                st.caption("Settings changed since the last build. Click Build PowerPoint again.")
+            st.download_button("Download PowerPoint", cached_deck(result, key_settings + key_specs + sig),
+                               file_name="report.pptx",
+                               mime="application/vnd.openxmlformats-officedocument.presentationml.presentation")
 
 
 if __name__ == "__main__":
