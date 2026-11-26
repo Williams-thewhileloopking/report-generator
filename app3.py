@@ -1532,6 +1532,12 @@ div[data-testid="stMetric"] { background: #FFFFFF; border: 1px solid #DDE5E1; bo
 div[data-testid="stVerticalBlockBorderWrapper"] { background: #FFFFFF; }
 .stButton > button, .stDownloadButton > button { background: #0E7C61; color: #FFFFFF; border: 0; }
 .stButton > button:hover, .stDownloadButton > button:hover { background: #0A5F4A; color: #FFFFFF; }
+/* Main-page PowerPoint action: clear, generous, but understated. */
+.stMainBlockContainer .stDownloadButton > button {
+  width: 100%; min-height: 3.25rem; padding: 0.75rem 1.25rem;
+  border-radius: 8px; font-size: 1.05rem; font-weight: 650;
+  letter-spacing: 0.01em;
+}
 section[data-testid="stSidebar"] { background: #E6EEEA; }
 .insight { border-left: 4px solid #0E7C61; background: #FFFFFF; padding: 0.7rem 0.9rem; border-radius: 4px; margin: 0.5rem 0; }
 .insight b { color: #0E7C61; font-size: 0.75rem; letter-spacing: 0.06em; }
@@ -2065,14 +2071,18 @@ def main():
         for slide in result["slides"]:
             show_slide_preview(slide, result["period"])
 
-    # Download is always in the sidebar, whichever tab you are on
-    with st.sidebar:
-        st.header("Download")
-        st.caption(f"{n_slides} slides")
+    # Keep the main download action at the bottom of the page, after the tabs.
+    st.divider()
+    _, download_col, _ = st.columns([1, 2, 1])
+    with download_col:
         if n_slides:
             st.download_button("Download PowerPoint", cached_deck(result, key_settings + key_specs + sig),
                                file_name="report.pptx",
-                               mime="application/vnd.openxmlformats-officedocument.presentationml.presentation")
+                               mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                               use_container_width=True)
+            st.caption(f"{n_slides} slides ready")
+        else:
+            st.caption("No slides to download yet.")
 
 
 if __name__ == "__main__":
